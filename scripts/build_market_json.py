@@ -135,6 +135,32 @@ def ratio_block(df, a, b):
     }
 
 
+COMPACT_FIELDS = ["close", "ret_1d", "ret_1w", "ret_1m", "rs_1w", "rs_1m", "rs_3m", "rs_rank",
+                  "vs_sma50", "vs_sma200", "from_52w_high", "tight"]
+COMPACT_RATIO = ["value", "chg_1w", "chg_1m", "chg_3m", "vs_sma50", "higher_low_20d"]
+
+
+def compact(data):
+    """Small snapshot the Thesis Board stores in its database (doc meta/market)."""
+    m, names, group = {}, {}, {}
+    for g in ("benchmarks", "sectors", "industries", "macro"):
+        for t, row in data[g].items():
+            if "error" in row:
+                continue
+            names[t] = row["name"]
+            group[t] = g
+            m[t] = {k: row[k] for k in COMPACT_FIELDS if row.get(k) is not None}
+    ratios = {k: {f: v[f] for f in COMPACT_RATIO if v.get(f) is not None} | {"desc": v.get("desc")}
+              for k, v in data["ratios"].items() if "error" not in v}
+    s = data["summary"]
+    return {
+        "as_of": data["as_of"], "generated_at": data["generated_at"],
+        "sector_rank": s["sector_rank"], "industry_rank": s["industry_rank"],
+        "leaders": s["industry_leaders_near_highs"], "basing": s["industries_basing"],
+        "names": names, "group": group, "m": m, "ratios": ratios,
+    }
+
+
 def main():
     tickers = sorted(set(SECTORS) | set(INDUSTRIES) | set(BENCHMARKS) | set(MACRO)
                      | {x for a, b, _ in RATIOS.values() for x in (a, b)})
@@ -203,6 +229,8 @@ def main():
     }
     with open("market.json", "w") as f:
         json.dump(data, f, indent=1)
+    with open("market_compact.json", "w") as f:
+        json.dump(compact(data), f, separators=(",", ":"))
     print(f"Wrote market.json as of {data['as_of']}: top sectors {sector_rank[:3]}, top industries {industry_rank[:5]}")
 
 
