@@ -7,7 +7,8 @@ import json
 import math
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -50,6 +51,14 @@ RATIOS = {
     "SMH/SPY": ("SMH", "SPY", "Semis vs market"),
 }
 
+# shortcut: NYSE full-day closures hardcoded through 2027, add the next year's before Jan 2028.
+NYSE_HOLIDAYS = {date.fromisoformat(d) for d in (
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19",
+    "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18",
+    "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+)}
+
 WINDOWS = {"1d": 1, "1w": 5, "1m": 21, "3m": 63, "6m": 126}
 
 
@@ -59,11 +68,24 @@ def r(x, nd=2):
     return round(float(x), nd)
 
 
+def last_completed_session(now=None):
+    """Most recent NYSE session that has closed (16:00 New York time)."""
+    if (now or datetime.now(timezone.utc)).year > max(NYSE_HOLIDAYS).year:
+        print("WARNING: NYSE_HOLIDAYS needs the current year added", file=sys.stderr)
+    ny = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    d = ny.date() if ny.hour >= 16 else ny.date() - timedelta(days=1)
+    while d.weekday() >= 5 or d in NYSE_HOLIDAYS:
+        d -= timedelta(days=1)
+    return d
+
+
 def download(tickers):
     for attempt in range(3):
         try:
+            # threads=False: parallel downloads hit "database is locked" on yfinance's
+            # sqlite cache and lost SPY entirely (run of 2026-11-12).
             df = yf.download(tickers, period="14mo", interval="1d", auto_adjust=True,
-                             group_by="ticker", threads=True, progress=False)
+                             group_by="ticker", threads=False, progress=False)
             if not df.empty:
                 return df
         except Exception as e:  # noqa: BLE001
@@ -72,12 +94,49 @@ def download(tickers):
     raise SystemExit("Could not download price data")
 
 
-def closes_for(df, t):
+def series(df, t):
     try:
-        s = df[t]["Close"].dropna()
+        return df[t]["Close"].dropna()
     except KeyError:
         return None
-    return s if len(s) > 30 else None
+
+
+def refetch(t):
+    try:
+        s = yf.Ticker(t).history(period="14mo", interval="1d", auto_adjust=True)["Close"].dropna()
+    except Exception as e:  # noqa: BLE001
+        print(f"{t}: history() failed: {e}", file=sys.stderr)
+        return None
+    s.index = s.index.tz_localize(None)  # match yf.download's naive date index
+    return s
+
+
+def fresh_closes(df, tickers, expected):
+    """Per-ticker closes; tickers behind `expected` are re-fetched one at a time."""
+    closes = {t: series(df, t) for t in tickers}
+    behind = lambda t: closes[t] is None or closes[t].empty or closes[t].index[-1].date() < expected
+    for attempt in range(3):
+        stale = [t for t in tickers if behind(t)]
+        if not stale:
+            break
+        print(f"attempt {attempt + 1}: {len(stale)} tickers missing {expected}: {stale}", file=sys.stderr)
+        if attempt:
+            time.sleep(30)
+        for t in stale:
+            s = refetch(t)
+            if s is not None and not s.empty and (closes[t] is None or closes[t].empty
+                                                  or s.index[-1] >= closes[t].index[-1]):
+                closes[t] = s
+    for t in tickers:
+        if behind(t):
+            last = closes[t].index[-1].date() if closes[t] is not None and not closes[t].empty else None
+            print(f"MISSING {expected}: {t} (last {last})", file=sys.stderr)
+    return closes
+
+
+def closes_for(closes, t):
+    s = closes.get(t)
+    return s if s is not None and len(s) > 30 else None
 
 
 def ret(s, n):
@@ -164,10 +223,13 @@ def compact(data):
 def main():
     tickers = sorted(set(SECTORS) | set(INDUSTRIES) | set(BENCHMARKS) | set(MACRO)
                      | {x for a, b, _ in RATIOS.values() for x in (a, b)})
-    df = download(tickers)
+    expected = last_completed_session()
+    df = fresh_closes(download(tickers), tickers, expected)
     bench = closes_for(df, BENCH)
     if bench is None:
         raise SystemExit("Benchmark SPY missing")
+    if bench.index[-1].date() < expected:
+        raise SystemExit(f"Stale data: SPY last date {bench.index[-1].date()} < last session {expected}; not writing")
 
     def block(names, with_rs=True):
         out = {}

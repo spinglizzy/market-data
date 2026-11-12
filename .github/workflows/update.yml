@@ -4,6 +4,9 @@ on:
   schedule:
     # Weekdays after the US close: 21:45 UTC (4:45pm ET in winter, 5:45pm ET in summer).
     - cron: "45 21 * * 1-5"
+    # Backup: GitHub cron often runs hours late (or skips); 00:15 UTC Tue-Sat lands before
+    # 10:45am Adelaide. Fails (no commit) rather than writing stale data.
+    - cron: "15 0 * * 2-6"
   workflow_dispatch:
 
 permissions:
@@ -21,7 +24,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install --upgrade yfinance pandas
+      # Pinned: versions from the last good run (2026-11-11). Bump deliberately.
+      - run: pip install "yfinance==1.8.0" "pandas==3.1.1"
       - run: python scripts/build_market_json.py
       - name: Commit market.json
         run: |
